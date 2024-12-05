@@ -7,6 +7,7 @@
 import os
 import warnings
 from threading import Thread
+import cv2
 
 import numpy as np
 import torch
@@ -231,15 +232,15 @@ def load_video_frames(
 
 
 
-def convert_img_to_tensor(img_np, image_size):
+# def convert_img_to_tensor(img_np, image_size):
     
-    img_np = cv2.resize(img_np, (image_size, image_size), interpolation=cv2.INTER_AREA)
-    if img_np.dtype == np.uint8:
-        img_np = img_np / 255.0
+#     img_np = cv2.resize(img_np, (image_size, image_size), interpolation=cv2.INTER_AREA)
+#     if img_np.dtype == np.uint8:
+#         img_np = img_np / 255.0
     
-    img = torch.from_numpy(img_np).permute(2, 0, 1)
+#     img = torch.from_numpy(img_np).permute(2, 0, 1)
     
-    return img, video_height, video_width
+#     return img, video_height, video_width
 
 def prepare_frameslist_for_sam2(
     frames_list,
@@ -251,7 +252,10 @@ def prepare_frameslist_for_sam2(
 ):
     
     video_height, video_width = frames_list[0].shape[0:2]  # the original video size
-    
+    img_mean = torch.tensor(img_mean, dtype=torch.float32)[:, None, None]
+    img_std = torch.tensor(img_std, dtype=torch.float32)[:, None, None]
+
+    num_frames = len(frames_list)
     images = torch.zeros(num_frames, 3, image_size, image_size, dtype=torch.float32)
     for n, frame in enumerate(frames_list):
         frame = cv2.resize(frame, (image_size, image_size), interpolation=cv2.INTER_AREA)
@@ -264,6 +268,7 @@ def prepare_frameslist_for_sam2(
         images = images.to(compute_device)
         img_mean = img_mean.to(compute_device)
         img_std = img_std.to(compute_device)
+    
     # normalize by mean and std
     images -= img_mean
     images /= img_std
