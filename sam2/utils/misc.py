@@ -99,6 +99,8 @@ def _load_img_as_tensor(img_path, image_size):
     img = torch.from_numpy(img_np).permute(2, 0, 1)
     video_width, video_height = img_pil.size  # the original video size
     return img, video_height, video_width
+    
+
 
 
 class AsyncVideoFrameLoader:
@@ -173,6 +175,9 @@ def load_video_frames(
     video_path,
     image_size,
     offload_video_to_cpu,
+    start_frame=None,
+    end_frame=None,
+    target_fps=None,
     img_mean=(0.485, 0.456, 0.406),
     img_std=(0.229, 0.224, 0.225),
     async_loading_frames=False,
@@ -185,6 +190,7 @@ def load_video_frames(
     is_bytes = isinstance(video_path, bytes)
     is_str = isinstance(video_path, str)
     is_mp4_path = is_str and os.path.splitext(video_path)[-1] in [".mp4", ".MP4"]
+    is_numpy_array = isinstance(video_path, np.ndarray)
     if is_bytes or is_mp4_path:
         return load_video_frames_from_video_file(
             video_path=video_path,
@@ -193,6 +199,9 @@ def load_video_frames(
             img_mean=img_mean,
             img_std=img_std,
             compute_device=compute_device,
+            start_frame=start_frame,
+            end_frame=end_frame,
+            target_fps=target_fps,
         )
     elif is_str and os.path.isdir(video_path):
         return load_video_frames_from_jpg_images(
@@ -204,10 +213,62 @@ def load_video_frames(
             async_loading_frames=async_loading_frames,
             compute_device=compute_device,
         )
+    elif(is_numpy_array):
+        return prepare_frameslist_for_sam2(
+            frames_list=video_path,
+            image_size=image_size,
+            offload_video_to_cpu=offload_video_to_cpu,
+            img_mean=img_mean,
+            img_std=img_std,
+            compute_device=compute_device,
+            )
     else:
         raise NotImplementedError(
             "Only MP4 video and JPEG folder are supported at this moment"
         )
+
+
+
+
+
+def convert_img_to_tensor(img_np, image_size):
+    
+    img_np = cv2.resize(img_np, (image_size, image_size), interpolation=cv2.INTER_AREA)
+    if img_np.dtype == np.uint8:
+        img_np = img_np / 255.0
+    
+    img = torch.from_numpy(img_np).permute(2, 0, 1)
+    
+    return img, video_height, video_width
+
+def prepare_frameslist_for_sam2(
+    frames_list,
+    image_size,
+    offload_video_to_cpu,
+    img_mean=(0.485, 0.456, 0.406),
+    img_std=(0.229, 0.224, 0.225),
+    compute_device=torch.device("cuda")
+):
+    
+    video_height, video_width = frames_list[0].shape[0:2]  # the original video size
+    
+    images = torch.zeros(num_frames, 3, image_size, image_size, dtype=torch.float32)
+    for n, frame in enumerate(frames_list):
+        frame = cv2.resize(frame, (image_size, image_size), interpolation=cv2.INTER_AREA)
+        if frame.dtype == np.uint8:
+            frame = frame / 255.0
+        frame = torch.from_numpy(frame).permute(2, 0, 1)
+        images[n] = frame
+        
+    if not offload_video_to_cpu:
+        images = images.to(compute_device)
+        img_mean = img_mean.to(compute_device)
+        img_std = img_std.to(compute_device)
+    # normalize by mean and std
+    images -= img_mean
+    images /= img_std
+    return images, video_height, video_width
+    
 
 
 def load_video_frames_from_jpg_images(
@@ -283,6 +344,9 @@ def load_video_frames_from_video_file(
     offload_video_to_cpu,
     img_mean=(0.485, 0.456, 0.406),
     img_std=(0.229, 0.224, 0.225),
+    start_frame=None,
+    end_frame=None,
+    target_fps=None,
     compute_device=torch.device("cuda"),
 ):
     """Load the video frames from a video file."""
@@ -292,13 +356,28 @@ def load_video_frames_from_video_file(
     img_std = torch.tensor(img_std, dtype=torch.float32)[:, None, None]
     # Get the original video height and width
     decord.bridge.set_bridge("torch")
-    video_height, video_width, _ = decord.VideoReader(video_path).next().shape
-    # Iterate over all frames in the video
-    images = []
-    for frame in decord.VideoReader(video_path, width=image_size, height=image_size):
-        images.append(frame.permute(2, 0, 1))
+    vr = decord.VideoReader(video_path,width=image_size,height=image_size)
+    video_height, video_width, _ = vr.next().shape
+    native_fps = vr.get_avg_fps()
+    # Compute the step size
+    if(target_fps is None):
+        step = 1
+    else:
+        step = native_fps / target_fps
+        
+    total_frames = len(vr)
+    start_idx = 0 if start_frame is None else max(0, min(start_frame, total_frames - 1))
+    end_idx = total_frames if end_frame is None else min(end_frame, total_frames)
+    # Efficiently calculate indices
+    frame_indices = np.arange(start_idx, end_idx, step).astype(int)
+    frames = vr.get_batch(frame_indices).float()
 
+    images = []
+    for frame in frames:
+        images.append(frame.permute(2, 0, 1))
+    
     images = torch.stack(images, dim=0).float() / 255.0
+    
     if not offload_video_to_cpu:
         images = images.to(compute_device)
         img_mean = img_mean.to(compute_device)
@@ -306,7 +385,39 @@ def load_video_frames_from_video_file(
     # normalize by mean and std
     images -= img_mean
     images /= img_std
+    
     return images, video_height, video_width
+
+# def load_video_frames_from_video_file(
+#     video_path,
+#     image_size,
+#     offload_video_to_cpu,
+#     img_mean=(0.485, 0.456, 0.406),
+#     img_std=(0.229, 0.224, 0.225),
+#     compute_device=torch.device("cuda"),
+# ):
+#     """Load the video frames from a video file."""
+#     import decord
+
+#     img_mean = torch.tensor(img_mean, dtype=torch.float32)[:, None, None]
+#     img_std = torch.tensor(img_std, dtype=torch.float32)[:, None, None]
+#     # Get the original video height and width
+#     decord.bridge.set_bridge("torch")
+#     video_height, video_width, _ = decord.VideoReader(video_path).next().shape
+#     # Iterate over all frames in the video
+#     images = []
+#     for frame in decord.VideoReader(video_path, width=image_size, height=image_size):
+#         images.append(frame.permute(2, 0, 1))
+
+#     images = torch.stack(images, dim=0).float() / 255.0
+#     if not offload_video_to_cpu:
+#         images = images.to(compute_device)
+#         img_mean = img_mean.to(compute_device)
+#         img_std = img_std.to(compute_device)
+#     # normalize by mean and std
+#     images -= img_mean
+#     images /= img_std
+#     return images, video_height, video_width
 
 
 def fill_holes_in_mask_scores(mask, max_area):
